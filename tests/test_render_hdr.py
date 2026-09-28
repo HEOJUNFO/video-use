@@ -13,9 +13,26 @@ render = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(render)
 
 
+PIX_FMTS_TABLE = """Pixel formats:
+FLAGS NAME            NB_COMPONENTS BITS_PER_PIXEL BIT_DEPTHS
+-----
+IO... yuv420p                3             12      8-8-8
+IO... yuv420p10le            3             15      10-10-10
+IO... yuv422p10le            3             20      10-10-10
+IO... gray10le               1             10      10
+IO... x2rgb10le              3             30      10-10-10
+"""
+
+
 class ToneMapDetectionTests(unittest.TestCase):
-    def _tonemap(self, frame: dict, stream: dict) -> str | None:
+    def setUp(self):
+        render._pix_fmt_bit_depths.cache_clear()
+        render._source_tonemap_filter.cache_clear()
+
+    def _tonemap(self, frame: dict, stream: dict, pix_fmts: str = PIX_FMTS_TABLE) -> str | None:
         def fake_run(cmd, **kwargs):
+            if "-pix_fmts" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout=pix_fmts, stderr="")
             show_entries = cmd[cmd.index("-show_entries") + 1]
             if show_entries.startswith("frame="):
                 self.assertIn("0%+#1", cmd)
@@ -65,6 +82,19 @@ class ToneMapDetectionTests(unittest.TestCase):
             self._tonemap(tags, tags)
         self.assertIn("transfer_characteristics", str(stop.exception))
 
+    def test_untagged_10bit_gray_and_packed_rgb_stop(self):
+        for pix_fmt in ("gray10le", "x2rgb10le"):
+            with self.subTest(pix_fmt=pix_fmt):
+                render._pix_fmt_bit_depths.cache_clear()
+                tags = {"pix_fmt": pix_fmt}
+                with self.assertRaises(SystemExit):
+                    self._tonemap(tags, tags)
+
+    def test_bit_depth_is_read_from_the_name_without_a_bit_depths_column(self):
+        tags = {"pix_fmt": "gray12le"}
+        with self.assertRaises(SystemExit):
+            self._tonemap(tags, tags, pix_fmts="")
+
     def test_bt2020_source_without_transfer_stops(self):
         tags = {"color_primaries": "bt2020", "color_space": "bt2020nc", "pix_fmt": "yuv420p"}
         with self.assertRaises(SystemExit):
@@ -76,6 +106,17 @@ class ToneMapDetectionTests(unittest.TestCase):
 
         with patch.object(render.subprocess, "run", side_effect=failing_run):
             self.assertIsNone(render.tonemap_filter(Path("source.mp4")))
+
+    def test_missing_ffprobe_is_treated_as_sdr(self):
+        with patch.object(render.subprocess, "run", side_effect=FileNotFoundError("ffprobe")):
+            self.assertIsNone(render.tonemap_filter(Path("source.mp4")))
+
+    def test_each_source_is_probed_once_per_render(self):
+        with patch.object(render, "tonemap_filter", return_value=None) as probe:
+            for _ in range(3):
+                render._source_tonemap_filter(Path("a.mp4"))
+            render._source_tonemap_filter(Path("b.mp4"))
+        self.assertEqual(probe.call_count, 2)
 
 
 if __name__ == "__main__":

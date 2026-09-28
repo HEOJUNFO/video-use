@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import re
 import subprocess
@@ -153,7 +154,7 @@ def _probe_color_entries(video: Path, section: str, extra: list[str]) -> dict:
             capture_output=True, text=True, check=True,
         )
         return (json.loads(out.stdout).get(f"{section}s") or [{}])[0]
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
+    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
         return {}
 
 
@@ -176,6 +177,31 @@ def probe_color(video: Path) -> dict[str, str | None]:
     }
 
 
+@functools.lru_cache(maxsize=None)
+def _pix_fmt_bit_depths() -> dict[str, int]:
+    """Deepest component of every pixel format, from the `ffprobe -pix_fmts` table."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-pix_fmts"],
+                             capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError):
+        return {}
+    depths = {}
+    for line in out.splitlines():
+        # FLAGS NAME NB_COMPONENTS BITS_PER_PIXEL BIT_DEPTHS, e.g. "IO... gray10le 1 10 10"
+        m = re.fullmatch(r"\S{5}\s+(\S+)\s+\d+\s+\d+\s+(\d+(?:-\d+)*)", line.strip())
+        if m:
+            depths[m[1]] = max(int(d) for d in m[2].split("-"))
+    return depths
+
+
+def _is_high_bit_depth(pix_fmt: str) -> bool:
+    depth = _pix_fmt_bit_depths().get(pix_fmt)
+    if depth is not None:
+        return depth > 8
+    # ffprobe older than 5.0 prints no BIT_DEPTHS column: read the depth from the name.
+    return bool(re.search(r"p1[0-6]|^p01[06]|(?:gray|rgb|bgr)1[0-6]", pix_fmt))
+
+
 def tonemap_filter(video: Path) -> str | None:
     """The HDR → SDR chain for a PQ or HLG source, or None for SDR.
 
@@ -195,7 +221,7 @@ def tonemap_filter(video: Path) -> str | None:
         return None
     pix_fmt = color["pix_fmt"] or ""
     wide = any("bt2020" in (color[f] or "") for f in ("color_primaries", "color_space"))
-    if wide or re.search(r"p1[0-6]|^p01[06]", pix_fmt):  # 10-16 bit, incl. p010/p016
+    if wide or _is_high_bit_depth(pix_fmt):
         hint = "BT.2020" if wide else pix_fmt
         sys.exit(
             f"{video.name}: {hint} with transfer {transfer or 'untagged'}, so it may be HLG, PQ, SDR "
@@ -204,6 +230,12 @@ def tonemap_filter(video: Path) -> str | None:
             "(18 HLG, 16 PQ, 1 SDR; h264_metadata for H.264)."
         )
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def _source_tonemap_filter(video: Path) -> str | None:
+    """tonemap_filter once per source: a render cuts many segments from the same file."""
+    return tonemap_filter(video)
 
 
 def is_portrait_source(video: Path) -> bool:
@@ -334,7 +366,7 @@ def extract_segment(
         scale = "scale=-2:1920" if portrait else "scale=1920:-2"
 
     vf_parts: list[str] = []
-    tonemap = tonemap_filter(source)
+    tonemap = _source_tonemap_filter(source.resolve())
     if tonemap:
         vf_parts.append(tonemap)
     vf_parts.append(scale)
